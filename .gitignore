@@ -1,0 +1,6 @@
+# build output
+/dist/
+/remote-hands
+/remote-hands.exe
+*.test
+*.out

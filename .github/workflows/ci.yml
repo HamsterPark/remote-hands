@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "Run gofmt on: $unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - name: Race detector
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Build every release target
+        run: VERSION=ci ./scripts/build.sh
+      - run: ls -l dist && cat dist/SHA256SUMS
+
+  installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: shellcheck install.sh scripts/build.sh
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | Out-String | Write-Error; exit 1 }
+          if ([IO.File]::ReadAllBytes("$PWD/install.ps1") | Where-Object { $_ -gt 127 }) { Write-Error 'install.ps1 must stay ASCII'; exit 1 }
