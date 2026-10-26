@@ -33,7 +33,7 @@ func TestConnectionLines(t *testing.T) {
 	if !strings.Contains(lines[0], url) || !strings.Contains(lines[0], "office-pc") {
 		t.Errorf("line 1 lacks URL or name: %s", lines[0])
 	}
-	for _, want := range []string{"claude mcp add -s user -t http office-pc", "codex mcp add office-pc --url", "restart"} {
+	for _, want := range []string{"claude mcp add -s user -t http office-pc", "claude mcp remove -s user office-pc", "codex mcp add office-pc --url", "restart"} {
 		if !strings.Contains(lines[1], want) {
 			t.Errorf("line 2 lacks %q: %s", want, lines[1])
 		}

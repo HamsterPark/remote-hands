@@ -98,7 +98,7 @@ func (u *ui) startActivityLog() {
 
 // activity records something a remote AI did. It never blocks.
 func (u *ui) activity(who, what string) {
-	line := time.Now().Format("15:04:05") + "  " + u.paint("36", who) + "  " + what + "\n"
+	line := time.Now().Format("15:04:05") + "  " + u.paint("36", printable(who)) + "  " + printable(what) + "\n"
 	select {
 	case u.logs <- line:
 	default:
@@ -127,6 +127,20 @@ func (u *ui) pause(ctx context.Context) {
 	case <-done:
 	case <-ctx.Done():
 	}
+}
+
+// printable replaces control and text-direction characters, so that text
+// coming from the network cannot move the cursor, clear the window or forge
+// lines in the activity log.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r < 0x20, r == 0x7f, r >= 0x80 && r < 0xa0,
+			r == 0x2028, r == 0x2029, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // oneLine shortens text for the activity log.

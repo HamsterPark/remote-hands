@@ -110,6 +110,20 @@ func TestEditKeepsCRLFAndUTF16(t *testing.T) {
 		t.Errorf("UTF-16 edit: %q %s", text, enc.name)
 	}
 
+	// A one-line old_string with a multi-line new_string must not bring
+	// bare "\n" into a Windows-style file.
+	mustCall(t, a, "edit_file", map[string]any{"path": crlf, "old_string": "2", "new_string": "two\nand a half"})
+	if b, _ := os.ReadFile(crlf); string(b) != "one\r\ntwo\r\nand a half\r\nthree\r\n" {
+		t.Errorf("CRLF edit with new lines: %q", b)
+	}
+
+	// UTF-16 that would not survive decoding and encoding again is left alone.
+	odd := filepath.Join(dir, "odd16.txt")
+	os.WriteFile(odd, []byte{0xFF, 0xFE, 'a', 0, 0x00, 0xD8, 'b', 0}, 0o644) // lone surrogate
+	if out, isErr := callTool(t, a, "edit_file", map[string]any{"path": odd, "old_string": "a", "new_string": "c"}); !isErr {
+		t.Errorf("unsafe UTF-16 edit was not refused: %s", out)
+	}
+
 	bin := filepath.Join(dir, "data.bin")
 	os.WriteFile(bin, []byte{1, 2, 0, 3}, 0o644)
 	if _, isErr := callTool(t, a, "read_file", map[string]any{"path": bin}); !isErr {
@@ -205,6 +219,42 @@ func TestBackgroundJobs(t *testing.T) {
 	}
 }
 
+func TestLongCommand(t *testing.T) {
+	// Longer than one command-line argument may be on Linux (128 KiB).
+	filler := strings.Repeat("# filler\n", 20000)
+	out := mustCall(t, newTestApp(t), "run_command", map[string]any{"command": "echo begin\n" + filler + "echo end", "wait_seconds": 55})
+	if !strings.Contains(out, "begin") || !strings.Contains(out, "end") || !strings.Contains(out, "Exit code: 0") {
+		t.Errorf("long command:\n%s", out)
+	}
+}
+
+func TestCancelledRequestKeepsOutput(t *testing.T) {
+	a := newTestApp(t)
+	j, err := a.jobs.start("echo kept-for-later", os.TempDir(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !j.wait(context.Background(), 30*time.Second) {
+		t.Fatal("command did not finish")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if r := a.jobReport(ctx, j, true); !r.IsError {
+		t.Errorf("cancelled request got a normal answer: %+v", r)
+	}
+	if out := j.report(true); !strings.Contains(out, "kept-for-later") {
+		t.Errorf("output was lost:\n%s", out)
+	}
+}
+
+func TestNoCommandsAfterShutdown(t *testing.T) {
+	a := newTestApp(t)
+	a.jobs.killAll()
+	if _, isErr := callTool(t, a, "run_command", map[string]any{"command": "echo late"}); !isErr {
+		t.Error("a command started after shutdown")
+	}
+}
+
 func TestCappedBuffer(t *testing.T) {
 	var b cappedBuffer
 	b.Write([]byte(strings.Repeat("a", outputHead)))
@@ -269,7 +319,7 @@ func TestFlexibleArguments(t *testing.T) {
 	if in.N.v != 12 || !in.N.set || in.M.v != 3 || !bool(in.B) {
 		t.Errorf("got %+v", in)
 	}
-	if seconds(flexInt{}, 45, 1, 300) != 45*time.Second || seconds(flexInt{v: 999, set: true}, 45, 1, 300) != 300*time.Second {
+	if seconds(flexInt{}, 45, 1, maxWaitSeconds) != 45*time.Second || seconds(flexInt{v: 999, set: true}, 45, 1, maxWaitSeconds) != maxWaitSeconds*time.Second {
 		t.Error("seconds() does not apply default and limits")
 	}
 }

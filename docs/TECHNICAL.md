@@ -27,7 +27,7 @@ Remote Hands works, configure it by hand, or build it.
 
    ```
    Remote Hands: please connect to my computer office-pc. It is an MCP server (streamable HTTP; the key is inside the URL, no other login): http://100.86.1.2:47863/mcp/0f3c…
-   How: Claude Code -> claude mcp add -s user -t http office-pc <URL> ; Codex -> codex mcp add office-pc --url <URL> ; then tell me to restart you, and use the office-pc tools (start with system_info).
+   How: Claude Code -> claude mcp add -s user -t http office-pc <URL> (if office-pc already exists, first: claude mcp remove -s user office-pc) ; Codex -> codex mcp add office-pc --url <URL> ; then tell me to restart you, and use the office-pc tools (start with system_info).
    ```
 
    They are plain ASCII without quotes, so e-mail and chat apps do not "smarten" them on the way.
@@ -45,35 +45,58 @@ The key, the port and an optional name are saved, so the lines stay the same acr
 | Tool              | What it does |
 |-------------------|--------------|
 | `system_info`     | OS, user, home and real Desktop folder (OneDrive-aware on Windows), shell, local time. |
-| `run_command`     | Runs a command in a fresh shell. If it is not done after `wait_seconds` (default 45), it keeps running in the background and the AI gets a `job_id`. Hard limit `timeout_seconds` (default 1800). |
+| `run_command`     | Runs a command in a fresh shell. If it is not done after `wait_seconds` (default 45, at most 55), it keeps running in the background and the AI gets a `job_id`. Hard limit `timeout_seconds` (default 1800). |
 | `check_command`   | Waits for a background command, returns its new output and finally the exit code; `stop=true` kills it with its child processes; without `job_id` it lists recent commands. |
-| `read_file`       | Text with line numbers, `offset`/`limit` paging. Understands UTF-8, UTF-8 with BOM, UTF-16 and (read-only) the Windows ANSI code page, e.g. GBK or windows-1250. |
+| `read_file`       | Text with line numbers, `offset`/`limit` paging; normal files up to 20 MB. Understands UTF-8, UTF-8 with BOM, UTF-16 and (read-only) legacy Windows code pages such as GBK or windows-1250. |
 | `write_file`      | Writes UTF-8 text, creates folders, can append. |
-| `edit_file`       | Exact search-and-replace; keeps the encoding and Windows line endings; refuses ambiguous matches. |
+| `edit_file`       | Exact search-and-replace; keeps the encoding and Windows line endings; refuses ambiguous matches and files it could not write back unchanged. |
 | `list_directory`  | Folders first, then files with size and date. |
 | `take_screenshot` | Every screen as a JPEG, at most 1568 px on the long side. |
 
-Background commands exist because MCP clients give up on slow tool calls (Codex after 60 s by default). Output is
-capped per read (first 8 KB and last 24 KB, with a note about what was skipped) and terminal colour codes are
-removed.
+Background commands exist because MCP clients stop waiting for a plain JSON answer: Claude Code's HTTP request
+timer starts at 60 s, and Codex has its own per-tool timeout. No call waits longer than 55 s; slow work continues
+in the background and the AI polls it. Output is capped per read (first 8 KB and last 24 KB, with a note about what
+was skipped), terminal colour codes are removed, and `read_file` returns at most 40 KB per call (Claude Code moves
+tool results over 50,000 characters into a file).
 
 When the AI connects, the server's `instructions` tell it which computer it controls, which shell it gets, that
 there is no keyboard input, and that the owner may not be technical (explain, prefer reversible steps, ask before
 deleting or installing).
 
+### Client compatibility
+
+Tested with Claude Code 2.1.310 (tools, background jobs and screenshots) and Codex 0.144.4 (connection). Notes for
+anyone changing the protocol code:
+
+* Newer Claude Code versions first send a `server/discover` probe (2026-07-28 protocol). The server answers it like
+  any unknown method, with a JSON-RPC `-32601` error, and Claude Code falls back to `initialize`.
+* `initialize` echoes the client's protocol version when it is one of 2025-11-25, 2025-06-18, 2025-03-26 or
+  2024-11-05 (Claude Code sends 2025-11-25, Codex 2025-06-18).
+* Codex probes the endpoint and `/.well-known/oauth-*` with GET when a server is added and at start-up; the `405`
+  and `404` answers tell it that no login is needed.
+* Results use `content` only, never `structuredContent` (Codex would show only the latter and drop images).
+* Claude Code and Codex read new servers only when they start, so the AI has to be restarted once after adding one.
+
 ### Commands
 
-* **Windows:** PowerShell 7 (`pwsh.exe`) if it is installed in Program Files, otherwise Windows PowerShell 5.1. The
-  command is saved as a temporary `.ps1` file with a UTF-8 byte order mark and run with `-NoProfile
-  -NonInteractive -ExecutionPolicy Bypass -File`, which avoids all command-line quoting problems. A prelude switches
-  output to UTF-8 and turns off progress bars and colours; an epilogue turns PowerShell's success flag into an exit
-  code (`$LASTEXITCODE` for programs, 1 for failed cmdlets). Commands get their own hidden console
-  (`CREATE_NO_WINDOW`), so they cannot write into the Remote Hands window or wait for keys typed there.
+* **Windows:** PowerShell 7 (`pwsh.exe`) if it is installed in Program Files, otherwise Windows PowerShell 5.1
+  (`REMOTE_HANDS_POWERSHELL` can name another one). The command is saved as a temporary `.ps1` file with a UTF-8
+  byte order mark and run with `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File`, which avoids all
+  command-line quoting problems. A prelude switches output to UTF-8, widens the console buffer to 300 columns (so
+  tables are not cut) and turns off progress bars and colours. The command runs inside a script block piped to
+  `Out-Default`, so PowerShell finishes printing tables before the script exits; afterwards PowerShell's success
+  flag becomes the exit code (`$LASTEXITCODE` for programs, 1 for failed cmdlets; stderr output of a program that
+  returned 0 does not count as failure, unlike in plain Windows PowerShell 5.1). Commands get their own hidden
+  console (`CREATE_NO_WINDOW`), so they cannot write into the Remote Hands window or wait for keys typed there.
   Stopping uses `taskkill /T /F`, which also ends child processes.
 * **macOS / Linux:** the user's shell if it is bash, zsh, dash, ksh or sh, otherwise `/bin/bash` or `/bin/sh`, run
-  as `<shell> -c <command>` in a new session (`setsid`). Without a controlling terminal, `sudo`, `ssh` and `git`
-  fail at once instead of waiting for a password. Stopping kills the whole process group.
+  as `<shell> -c <command>` (or from a temporary file for commands over 64 KB) in a new session (`setsid`).
+  Without a controlling terminal, `sudo`, `ssh` and `git` fail at once instead of waiting for a password. Stopping
+  kills the whole process group.
 * Everywhere: stdin is empty, `GIT_TERMINAL_PROMPT=0` and `NO_COLOR=1` are set, at most 16 commands run at once.
+  Stop and timeout go through `exec.CommandContext`, which only kills a process that has not been reaped yet, so a
+  reused process id is never hit. A background process that a command leaves behind should redirect its output
+  (`nohup program >/dev/null 2>&1 &`): Remote Hands stops reading the output 3 s after the command itself ended.
 
 ### Other details
 
@@ -86,14 +109,16 @@ deleting or installing).
 
 ## Security model
 
-* **Who can connect:** only devices that are in the same tailnet *and* know the 128-bit key in the URL. Tailscale
-  ACLs can narrow this further (for example, allow port 47863 only from your own laptop).
+* **Who can connect:** only devices that are in the same tailnet *and* know the 128-bit key in the URL. Requests
+  whose sender address is not a Tailscale address (`100.64.0.0/10`) or this computer are refused, even if they
+  reach the port some other way. Tailscale ACLs can narrow this further (for example, allow port 47863 only from
+  your own laptop).
 * **What a connected AI can do:** everything the logged-in user can do on that computer. Remote Hands does not
   elevate; a UAC prompt or `sudo` password has to be answered by a person at the computer.
 * **Browsers:** requests that carry an `Origin` header are refused, so a web page cannot talk to the server even if
   it learned the address.
-* **Wrong key:** `403 Forbidden`, not `401`, because a 401 makes MCP clients start an OAuth login. Failed attempts
-  appear in the activity log (at most once a minute).
+* **Wrong key:** `404 Not Found`, not `401` or `403`, because MCP clients answer those with an OAuth login. Failed
+  attempts appear in the activity log (at most once a minute).
 * **Revoking access:** type `new` in the window (or start with `--new-key`). Every old URL stops working at once.
 * **The key is stored in plain text** in the settings file above and, on the AI computers, in the Claude Code /
   Codex configuration – just like the API keys those tools already store. Anyone who can read those files can
@@ -113,7 +138,11 @@ remote-hands [options]
   -version         print the version
 ```
 
-Environment variables: `REMOTE_HANDS_LANG`, `REMOTE_HANDS_CONFIG` (path of the settings file), `NO_COLOR`.
+Environment variables: `REMOTE_HANDS_LANG`, `REMOTE_HANDS_CONFIG` (path of the settings file),
+`REMOTE_HANDS_POWERSHELL` (Windows: the PowerShell to run commands with), `NO_COLOR`.
+
+If Remote Hands is already running, starting it again only shows that copy's lines; `-new-key`, `-name` and `-port`
+are refused then, so a key cannot look revoked while the running copy still accepts it.
 
 The installers also understand `REMOTE_HANDS_DOWNLOAD` (base URL of a mirror that holds the release files),
 `REMOTE_HANDS_NO_START=1` (install only) and `REMOTE_HANDS_NO_SHORTCUTS=1` (Windows: no Desktop/Start-menu
@@ -157,8 +186,9 @@ VERSION=v1.2.3 ./scripts/build.sh   # all release binaries + SHA256SUMS in dist/
 ```
 
 Pushing a tag `v*` runs `.github/workflows/release.yml`: it tests, builds Windows (amd64, arm64), macOS (amd64,
-arm64) and Linux (amd64, arm64, armv7) binaries, publishes a GitHub release, and then installs that release with
-`install.ps1` / `install.sh` on Windows, macOS and Linux runners.
+arm64) and Linux (amd64, arm64, armv6+) binaries, publishes a GitHub release, and then installs that release with
+`install.ps1` / `install.sh` on Windows, macOS and Linux runners. Tags with a dash (`v0.2.0-rc1`) become
+pre-releases, which the installers do not pick up.
 
 | File                    | Purpose |
 |-------------------------|---------|
@@ -169,6 +199,6 @@ arm64) and Linux (amd64, arm64, armv7) binaries, publishes a GitHub release, and
 | `jobs.go`               | running commands, background jobs, output capping |
 | `textcodec.go`          | text file encodings |
 | `sysinfo.go`            | system facts and screenshots |
-| `platform_windows.go`, `platform_other.go` | everything system-specific |
+| `platform_windows.go`, `platform_other.go`, `term_*.go` | everything system-specific |
 | `ui.go`, `i18n.go`      | the window: layout and English / Chinese / Czech texts |
 | `install.ps1`, `install.sh` | one-line installers |

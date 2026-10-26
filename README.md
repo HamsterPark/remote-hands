@@ -2,9 +2,9 @@
 
 # Remote Hands
 
-**Let Claude Code or Codex on one of your computers work on another one of your computers – privately, through Tailscale.**
-
 **English** · [中文](README.zh-CN.md) · [Čeština](README.cs.md)
+
+**Let Claude Code or Codex on one of your computers work on another one of your computers – privately, through Tailscale.**
 
 [![CI](https://github.com/HamsterPark/remote-hands/actions/workflows/ci.yml/badge.svg)](https://github.com/HamsterPark/remote-hands/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/HamsterPark/remote-hands)](https://github.com/HamsterPark/remote-hands/releases/latest)
@@ -51,7 +51,7 @@ You need:
 
 * Two computers with **Windows 10 or 11**, **macOS 13 or newer**, or **Linux**, both connected to the internet.
   They can be in different houses or countries.
-* **Claude Code** ([how to install](https://docs.claude.com/en/docs/claude-code/overview)) or **Codex**
+* **Claude Code** ([how to install](https://code.claude.com/docs/en/overview)) or **Codex**
   ([how to install](https://developers.openai.com/codex)) already working on the AI computer.
 * A **Google, Microsoft, Apple or GitHub account** to log in to Tailscale. Tailscale is free for personal use.
 * About **15 minutes**.
@@ -74,7 +74,7 @@ Step 2.
 3. When the download has finished, open the file (it is called something like `tailscale-setup-….exe` and is in
    your **Downloads** folder).
 4. Windows asks *"Do you want to allow this app to make changes to your device?"* – click **Yes**.
-5. Follow the installer: click **Install** and at the end **Close**.
+5. Follow the installer to the end (accept the license if it asks, and click **Install**).
 6. Tailscale now lives as a small icon at the **bottom right of the screen, next to the clock**. If you cannot see
    it, click the small arrow **^** there – it may be hidden in that box.
 
@@ -146,8 +146,10 @@ starts with **100.** – and, under **Network devices**, the other computer. You
 3. Click into the PowerShell window, paste with <kbd>Ctrl</kbd>+<kbd>V</kbd> (or a right click) and press
    <kbd>Enter</kbd>.
 4. After a few seconds the Remote Hands screen appears (see the example below).
-5. If Windows shows *"Windows Defender Firewall has blocked some features of this app"*, leave **Private networks**
-   ticked and click **Allow access**. (This is needed so the AI computer can connect.)
+5. Windows may ask about its firewall. This is needed so that the AI computer can connect:
+   * If it says *"Windows Defender Firewall has blocked some features of this app"*, leave **Private networks**
+     ticked and click **Allow access**.
+   * On newer Windows 11 it asks *"Do you want to allow private networks to access this app?"* – click **Allow**.
 
 ### Mac
 
@@ -180,7 +182,7 @@ Open a terminal and run the same line as on the Mac.
 COPY THE 2 LINES BELOW and paste them into Claude Code or Codex on your OTHER computer:
 ==================================================================
 Remote Hands: please connect to my computer office-pc. It is an MCP server (streamable HTTP; the key is inside the URL, no other login): http://100.86.1.2:47863/mcp/0f3c9a2b7d4e8f1a6b5c3d2e9f0a1b7c
-How: Claude Code -> claude mcp add -s user -t http office-pc <URL> ; Codex -> codex mcp add office-pc --url <URL> ; then tell me to restart you, and use the office-pc tools (start with system_info).
+How: Claude Code -> claude mcp add -s user -t http office-pc <URL> (if office-pc already exists, first: claude mcp remove -s user office-pc) ; Codex -> codex mcp add office-pc --url <URL> ; then tell me to restart you, and use the office-pc tools (start with system_info).
 ==================================================================
 (They are already copied to this computer's clipboard. To get them to your other computer, e-mail them to yourself or send them to yourself in a chat app.)
 
@@ -197,9 +199,11 @@ What the AI does on this computer:
 
 Your computer's name, address and key will be different.
 
-The window speaks your computer's language (English, Chinese or Czech). To choose it yourself, put
-`$env:REMOTE_HANDS_LANG='zh'; ` in front of the Windows line, or replace the last `sh` of the Mac/Linux line with
-`REMOTE_HANDS_LANG=cs sh` (`en`, `zh` or `cs`).
+The window speaks your computer's language (English, Chinese or Czech). To choose the language yourself (`en`,
+`zh` or `cs`):
+
+* Windows: put `$env:REMOTE_HANDS_LANG='cs'; ` in front of the line.
+* Mac and Linux: change the `| sh` at the end of the line to `| REMOTE_HANDS_LANG=cs sh`.
 
 > [!NOTE]
 > **Next time** you do not need the line again: double-click **Remote Hands** on the Desktop (on Windows it is also in
@@ -229,9 +233,9 @@ On the AI computer, open that message and copy the two lines.
 3. The AI wants to run one command that saves the connection (it starts with `claude mcp add` or `codex mcp add`).
    It asks for your permission – choose **Yes**.
 4. **Restart the AI** so that it loads the new connection:
-   * **Claude Code:** type `/exit` and press <kbd>Enter</kbd>, then start it again with `claude`
-     (`claude --continue` brings back the conversation).
-   * **Codex:** type `/quit` and press <kbd>Enter</kbd>, then start it again with `codex`.
+   * **Claude Code:** type `/exit` and press <kbd>Enter</kbd>, then type `claude --continue` and press
+     <kbd>Enter</kbd> (this also brings back your conversation).
+   * **Codex:** type `/exit` and press <kbd>Enter</kbd>, then type `codex resume --last` and press <kbd>Enter</kbd>.
    * In an app (Claude desktop app, VS Code, Codex app): close it completely and open it again.
 5. Try it: write *"Use the system_info tool of office-pc. Which computer is that?"* (use your computer's name from
    the two lines instead of `office-pc`).
@@ -294,25 +298,27 @@ Check one by one:
 2. Is the remote computer **awake**? (Not asleep, laptop lid open.)
 3. Is Tailscale **connected on both computers with the same account**? Click the Tailscale icon on each.
 4. **Windows firewall:** if you clicked *Cancel* when Windows asked about the firewall, Windows now blocks Remote
-   Hands. Click Start, type **Windows Defender Firewall with Advanced Security**, open it, click **Inbound Rules**,
-   find the rules named **remote-hands.exe** with a red sign, delete them (right click → **Delete**), start
-   Remote Hands again and click **Allow access** this time.
+   Hands. Press <kbd>Windows</kbd>+<kbd>R</kbd>, type `wf.msc` and press <kbd>Enter</kbd>. In the window that
+   opens (*Windows Defender Firewall with Advanced Security*), click **Inbound Rules**, find the rules named
+   **remote-hands.exe** with a red sign, delete them (right click → **Delete**), start Remote Hands again and click
+   **Allow access** this time.
 5. Ask the AI to run `curl http://<the 100.x.y.z address>:47863/health`. If it answers `remote-hands ok`, the
    connection works and the problem is in the AI's settings: ask it to check them with `claude mcp list` or
    `codex mcp list`.
 </details>
 
 <details>
-<summary><b>The AI says "wrong key"</b></summary>
+<summary><b>The AI says "wrong key" or "404 / not found"</b></summary>
 
 Someone typed `new` in the Remote Hands window, so the old lines no longer work. Copy the new two lines from the
-window and give them to the AI (Steps 4 and 5).
+window and give them to the AI (Steps 4 and 5) – it will replace the old connection.
 </details>
 
 <details>
 <summary><b>I lost the two lines</b></summary>
 
-Look at the Remote Hands window, or start Remote Hands again – it always shows the same two lines.
+Look at the Remote Hands window, or start Remote Hands again – it always shows the current two lines (they only
+change when someone types `new`).
 </details>
 
 <details>
@@ -326,16 +332,17 @@ installer checks that the download is exactly the published file. If you trust i
 <details>
 <summary><b>Mac: the screenshots show only the desktop background</b></summary>
 
-Open **System Settings → Privacy & Security → Screen & System Audio Recording** and switch on **Terminal**.
-Then close Remote Hands and start it again.
+Open **System Settings → Privacy & Security → Screen & System Audio Recording** (on macOS 13: **Screen
+Recording**) and switch on **Terminal**. Then close Remote Hands and start it again.
 </details>
 
 <details>
 <summary><b>The download from GitHub does not work (for example in mainland China)</b></summary>
 
-Try again later or with a VPN. You can also download the program by hand from the
-[releases page](https://github.com/HamsterPark/remote-hands/releases/latest) – on Windows
-`remote-hands-windows-amd64.exe` – and double-click it.
+Try again later or with a VPN. On Windows you can also download the program by hand from the
+[releases page](https://github.com/HamsterPark/remote-hands/releases/latest) – `remote-hands-windows-amd64.exe`
+(or `remote-hands-windows-arm64.exe` on the rare Windows computers with an ARM processor) – and double-click it.
+On a Mac or Linux the Terminal line is the easiest way; if GitHub is blocked, use it with a VPN.
 </details>
 
 <details>

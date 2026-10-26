@@ -1,16 +1,21 @@
 name: Release
 
 # Push a tag like v0.1.0 to build the programs and publish a GitHub release.
+# Tags with a dash (v0.2.0-rc1) become pre-releases, which the installers ignore.
 on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -18,25 +23,29 @@ jobs:
           go-version: stable
       - run: go vet ./... && go test -count=1 ./...
       - name: Build
-        run: VERSION="$GITHUB_REF_NAME" ./scripts/build.sh
+        run: VERSION="$TAG" ./scripts/build.sh
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Remote Hands $GITHUB_REF_NAME" \
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" dist/* $prerelease \
+            --title "Remote Hands $TAG" \
             --notes "Start here: https://github.com/${GITHUB_REPOSITORY}#readme - the guide shows the one line to paste. The files below are the program for each system; SHA256SUMS lets the installers check the downloads." \
             --generate-notes
 
   # Install the published release exactly as users do, on every system.
   installers:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     env:
+      TAG: ${{ github.ref_name }}
       REMOTE_HANDS_NO_START: '1'
       REMOTE_HANDS_NO_SHORTCUTS: '1'
     steps:
@@ -44,10 +53,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          irm "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.ps1" | iex
+          irm "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:TAG/install.ps1" | iex
           & "$env:LOCALAPPDATA\Programs\RemoteHands\remote-hands.exe" --version
       - name: macOS / Linux installer
         if: runner.os != 'Windows'
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.sh" | sh
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$TAG/install.sh" | sh
           "$HOME/.local/bin/remote-hands" --version

@@ -29,6 +29,7 @@ type job struct {
 	command string
 	started time.Time
 	cmd     *exec.Cmd
+	cancel  context.CancelFunc // kills the command if it still runs
 	out     *cappedBuffer
 	done    chan struct{}
 
@@ -112,9 +113,11 @@ func (j *job) report(finished bool) string {
 }
 
 type jobManager struct {
-	mu   sync.Mutex
-	next int
-	jobs map[int]*job
+	mu       sync.Mutex
+	next     int
+	starting int  // slots reserved by start() calls in progress
+	closed   bool // shutting down: no new commands
+	jobs     map[int]*job
 }
 
 func newJobManager() *jobManager {
@@ -122,8 +125,13 @@ func newJobManager() *jobManager {
 }
 
 func (m *jobManager) start(command, dir string, timeout time.Duration) (*job, error) {
+	// Reserve a slot first, so that parallel calls cannot exceed maxRunning.
 	m.mu.Lock()
-	running := 0
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("Remote Hands is shutting down")
+	}
+	running := m.starting
 	for _, j := range m.jobs {
 		if !j.finished() {
 			running++
@@ -133,15 +141,38 @@ func (m *jobManager) start(command, dir string, timeout time.Duration) (*job, er
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%d commands are still running; wait for them or stop some with check_command", running)
 	}
+	m.starting++
 	m.next++
 	id := m.next
 	m.mu.Unlock()
 
-	cmd, cleanup, err := shellCommand(command)
+	j, err := launch(id, command, dir, timeout)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.starting--
 	if err != nil {
 		return nil, err
 	}
-	j := &job{id: id, command: command, started: time.Now(), cmd: cmd, out: &cappedBuffer{}, done: make(chan struct{})}
+	m.jobs[id] = j
+	if m.closed { // shutdown began while the command was starting
+		j.mu.Lock()
+		j.stopped = true
+		j.mu.Unlock()
+		j.cancel()
+	}
+	m.pruneLocked()
+	return j, nil
+}
+
+func launch(id int, command, dir string, timeout time.Duration) (*job, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	cmd, cleanup, err := shellCommand(ctx, command)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	j := &job{id: id, command: command, started: time.Now(), cmd: cmd, cancel: cancel, out: &cappedBuffer{}, done: make(chan struct{})}
 	cmd.Dir = dir
 	cmd.Stdout = j.out
 	cmd.Stderr = j.out
@@ -154,26 +185,28 @@ func (m *jobManager) start(command, dir string, timeout time.Duration) (*job, er
 	// When a command leaves a background process behind that still holds
 	// the output pipe, stop waiting for it shortly after the command ends.
 	cmd.WaitDelay = 3 * time.Second
+	// exec calls Cancel (on timeout, stop or shutdown) only while the
+	// process has not been reaped, so its id cannot belong to another
+	// program yet.
+	cmd.Cancel = func() error {
+		j.mu.Lock()
+		if !j.stopped {
+			j.timedOut = true
+		}
+		j.mu.Unlock()
+		killTree(cmd)
+		return nil
+	}
 	prepareProcess(cmd)
 	if err := cmd.Start(); err != nil {
+		cancel()
 		cleanup()
 		return nil, err
 	}
 
-	m.mu.Lock()
-	m.jobs[id] = j
-	m.pruneLocked()
-	m.mu.Unlock()
-
 	go func() {
-		timer := time.AfterFunc(timeout, func() {
-			j.mu.Lock()
-			j.timedOut = true
-			j.mu.Unlock()
-			killTree(cmd)
-		})
 		err := cmd.Wait()
-		timer.Stop()
+		cancel()
 		cleanup()
 		j.exitCode = -1
 		if cmd.ProcessState != nil {
@@ -181,7 +214,8 @@ func (m *jobManager) start(command, dir string, timeout time.Duration) (*job, er
 		}
 		var exitErr *exec.ExitError
 		switch {
-		case err == nil, errors.As(err, &exitErr):
+		case err == nil, errors.As(err, &exitErr),
+			errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		case errors.Is(err, exec.ErrWaitDelay):
 			j.lingered = true
 		default:
@@ -220,24 +254,41 @@ func (m *jobManager) get(id int) *job {
 }
 
 func (m *jobManager) stop(ctx context.Context, j *job) bool {
-	// Never kill by process id after the job ended: the id may already
-	// belong to an unrelated process.
 	if j.finished() {
 		return true
 	}
 	j.mu.Lock()
 	j.stopped = true
 	j.mu.Unlock()
-	killTree(j.cmd)
+	j.cancel()
 	return j.wait(ctx, 10*time.Second)
 }
 
+// killAll stops every running command and refuses new ones. It waits a
+// moment for them to end, because Remote Hands is about to exit (Windows
+// allows a few seconds after the window is closed).
 func (m *jobManager) killAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.closed = true
+	var running []*job
 	for _, j := range m.jobs {
 		if !j.finished() {
-			killTree(j.cmd)
+			running = append(running, j)
+		}
+	}
+	m.mu.Unlock()
+	for _, j := range running {
+		j.mu.Lock()
+		j.stopped = true
+		j.mu.Unlock()
+		j.cancel() // the kills run in parallel, one goroutine per command
+	}
+	deadline := time.After(3 * time.Second)
+	for _, j := range running {
+		select {
+		case <-j.done:
+		case <-deadline:
+			return
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ var (
 	procGetUserDefaultUILanguage = kernel32.NewProc("GetUserDefaultUILanguage")
 	procMultiByteToWideChar      = kernel32.NewProc("MultiByteToWideChar")
 	procGetACP                   = kernel32.NewProc("GetACP")
+	procGetOEMCP                 = kernel32.NewProc("GetOEMCP")
 	procRtlGetVersion            = syscall.NewLazyDLL("ntdll.dll").NewProc("RtlGetVersion")
 	procSHGetKnownFolderPath     = syscall.NewLazyDLL("shell32.dll").NewProc("SHGetKnownFolderPath")
 	procCoTaskMemFree            = syscall.NewLazyDLL("ole32.dll").NewProc("CoTaskMemFree")
@@ -124,10 +126,18 @@ func systemRoot() string {
 	return `C:\Windows`
 }
 
-// powerShell prefers PowerShell 7 when it is installed normally (not the
-// Microsoft Store build, which virtualises parts of the file system), and
-// otherwise uses the Windows PowerShell that every Windows has.
-var powerShell = sync.OnceValue(func() string {
+// powerShell returns REMOTE_HANDS_POWERSHELL if set, else PowerShell 7 when
+// it is installed normally (not the Microsoft Store build, which
+// virtualises parts of the file system), else the Windows PowerShell that
+// every Windows has.
+func powerShell() string {
+	if p := os.Getenv("REMOTE_HANDS_POWERSHELL"); p != "" {
+		return p
+	}
+	return defaultPowerShell()
+}
+
+var defaultPowerShell = sync.OnceValue(func() string {
 	for _, env := range []string{"ProgramW6432", "ProgramFiles"} {
 		if d := os.Getenv(env); d != "" {
 			p := filepath.Join(d, "PowerShell", "7", "pwsh.exe")
@@ -140,30 +150,45 @@ var powerShell = sync.OnceValue(func() string {
 })
 
 func shellName() string {
-	if filepath.Base(powerShell()) == "pwsh.exe" {
+	if strings.EqualFold(filepath.Base(powerShell()), "pwsh.exe") {
 		return "PowerShell 7 (pwsh.exe)"
 	}
 	return "Windows PowerShell 5.1 (powershell.exe)"
 }
 
 // The command is saved as a script file, which avoids every quoting problem
-// of the Windows command line. The prelude makes output UTF-8 and hides
-// progress bars; the epilogue turns PowerShell's success flag into an exit
-// code (1 for failed cmdlets, the program's own code for native programs).
+// of the Windows command line.
+//
+// The prelude makes output UTF-8, wide (tables are cut at the console width)
+// and free of progress bars and colours.
+//
+// The command itself runs in a script block whose output goes through
+// Out-Default before the script exits: a bare exit would drop tables that
+// PowerShell is still formatting. Afterwards PowerShell's success flag
+// becomes the exit code: the program's own code for native programs, 1 for
+// failed cmdlets. Windows PowerShell 5.1 also counts any stderr output of a
+// program as failure ("NativeCommandError"); that is ignored when the
+// program itself returned 0.
 const (
 	psPrelude = "$ProgressPreference = 'SilentlyContinue'\r\n" +
 		"if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }\r\n" +
 		"try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\r\n" +
-		"$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\r\n"
-	psEpilogue = "\r\nif ($?) { exit 0 } elseif ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }\r\n"
+		"$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\r\n" +
+		"try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(300, 9999) } catch {}\r\n" +
+		"$global:__rhOk = $true; $global:__rhCode = $null; $global:__rhNative = $false\r\n" +
+		"& {\r\n"
+	psEpilogue = "\r\n$global:__rhOk = $?; $global:__rhCode = $LASTEXITCODE; " +
+		"$global:__rhNative = ($Error.Count -gt 0 -and $Error[0].FullyQualifiedErrorId -like 'NativeCommandError*')\r\n" +
+		"} | Out-Default\r\n" +
+		"if ($global:__rhOk -or ($global:__rhNative -and -not $global:__rhCode)) { exit 0 } elseif ($global:__rhCode) { exit $global:__rhCode } else { exit 1 }\r\n"
 )
 
-func shellCommand(command string) (*exec.Cmd, func(), error) {
+func shellCommand(ctx context.Context, command string) (*exec.Cmd, func(), error) {
 	script, err := writePSScript(psPrelude + command + psEpilogue)
 	if err != nil {
 		return nil, nil, err
 	}
-	cmd := exec.Command(powerShell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script)
+	cmd := exec.CommandContext(ctx, powerShell(), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script)
 	return cmd, func() { os.Remove(script) }, nil
 }
 
@@ -217,24 +242,54 @@ func desktopDir(home string) string {
 	return string(utf16.Decode(unsafe.Slice(p, n)))
 }
 
-// decodeANSI decodes text in the Windows "ANSI" code page.
+// decodeANSI decodes text in a legacy Windows code page. It tries the
+// system's ANSI and OEM code pages and then the usual code page of the
+// display language (GBK for Chinese, windows-1250 for Czech, windows-1252
+// otherwise), which matters when Windows is set to use UTF-8 for both.
 func decodeANSI(data []byte) (string, string, bool) {
 	if len(data) == 0 || len(data) > 1<<30 {
 		return "", "", false
 	}
+	acp, _, _ := procGetACP.Call()
+	oem, _, _ := procGetOEMCP.Call()
+	tried := map[uintptr]bool{}
+	for _, cp := range []uintptr{acp, oem, languageCodePage()} {
+		if cp == 0 || cp == 65001 || tried[cp] {
+			continue
+		}
+		tried[cp] = true
+		if s, ok := decodeCodePage(cp, data); ok {
+			return s, fmt.Sprintf("Windows code page %d (edit_file will not change it)", cp), true
+		}
+	}
+	return "", "", false
+}
+
+func decodeCodePage(cp uintptr, data []byte) (string, bool) {
 	const mbErrInvalidChars = 0x8
-	src, srcLen := uintptr(unsafe.Pointer(&data[0])), uintptr(len(data))
-	n, _, _ := procMultiByteToWideChar.Call(0, mbErrInvalidChars, src, srcLen, 0, 0)
+	n, _, _ := procMultiByteToWideChar.Call(cp, mbErrInvalidChars, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), 0, 0)
 	if n == 0 {
-		return "", "", false
+		return "", false
 	}
 	buf := make([]uint16, n)
-	n, _, _ = procMultiByteToWideChar.Call(0, mbErrInvalidChars, src, srcLen, uintptr(unsafe.Pointer(&buf[0])), n)
+	n, _, _ = procMultiByteToWideChar.Call(cp, mbErrInvalidChars, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(&buf[0])), n)
 	if n == 0 {
-		return "", "", false
+		return "", false
 	}
-	acp, _, _ := procGetACP.Call()
-	return string(utf16.Decode(buf[:n])), fmt.Sprintf("Windows code page %d (edit_file will not change it)", acp), true
+	return string(utf16.Decode(buf[:n])), true
+}
+
+func languageCodePage() uintptr {
+	lang, _, _ := procGetUserDefaultUILanguage.Call()
+	switch {
+	case lang == 0x0804 || lang == 0x1004: // Chinese (PRC, Singapore)
+		return 936
+	case lang&0x3ff == 0x04: // other Chinese
+		return 950
+	case lang&0x3ff == 0x05: // Czech
+		return 1250
+	}
+	return 1252
 }
 
 // The screenshot script makes the process DPI aware first; otherwise

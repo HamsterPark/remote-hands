@@ -17,11 +17,6 @@ import (
 
 func setupConsole() bool { return isTerminal(os.Stdout) }
 
-func isTerminal(f *os.File) bool {
-	st, err := f.Stat()
-	return err == nil && st.Mode()&os.ModeCharDevice != 0
-}
-
 func setConsoleTitle(title string) {
 	if isTerminal(os.Stdout) {
 		fmt.Printf("\x1b]0;%s\x07", title)
@@ -105,8 +100,25 @@ func shellName() string {
 	return fmt.Sprintf("%s (%s -c)", filepath.Base(unixShell()), unixShell())
 }
 
-func shellCommand(command string) (*exec.Cmd, func(), error) {
-	return exec.Command(unixShell(), "-c", command), func() {}, nil
+func shellCommand(ctx context.Context, command string) (*exec.Cmd, func(), error) {
+	// One argument may not be longer than 128 KiB on Linux, so long scripts
+	// go through a temporary file.
+	if len(command) < 64<<10 {
+		return exec.CommandContext(ctx, unixShell(), "-c", command), func() {}, nil
+	}
+	f, err := os.CreateTemp("", "remote-hands-*.sh")
+	if err != nil {
+		return nil, nil, err
+	}
+	_, err = f.WriteString(command)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return nil, nil, err
+	}
+	return exec.CommandContext(ctx, unixShell(), f.Name()), func() { os.Remove(f.Name()) }, nil
 }
 
 func osDescription() string {

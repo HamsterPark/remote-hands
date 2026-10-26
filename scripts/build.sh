@@ -14,7 +14,8 @@ for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 linux/amd64 
 	out="dist/remote-hands-$os-$arch"
 	[ "$os" = windows ] && out="$out.exe"
 	echo "building $out"
-	CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=7 \
+	# GOARM=6 runs on every Raspberry Pi, including the Zero and the 1.
+	CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=6 \
 		go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$out" .
 done
 

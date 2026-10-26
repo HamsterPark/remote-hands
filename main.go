@@ -150,8 +150,13 @@ func run(args []string) int {
 	}
 
 	// Started a second time (for example to see the two lines again):
-	// show the lines of the copy that is already running.
-	if !exactPort && alreadyRunning(urlHost, cfg.Port) {
+	// show the lines of the copy that is already running. Changing its key,
+	// name or port has to happen in that copy, or a "revoked" key would
+	// silently keep working there.
+	if !exactPort && (alreadyRunning(urlHost, cfg.Port) || savedPort != cfg.Port && alreadyRunning(urlHost, savedPort)) {
+		if opts.newKey || opts.name != "" || opts.port > 0 {
+			return u.fatal(ctx, u.t("already.flags"))
+		}
 		cur := loadConfig(cfgPath)
 		if validToken(cur.Token) && cur.Port == cfg.Port {
 			u.say(u.t("already"))
@@ -177,9 +182,18 @@ func run(args []string) int {
 	}
 
 	a := newApp(name, urlHost, cfg.Token, u)
+	a.tailnetOnly = !exactPort
 	srv := &http.Server{Handler: a.routes(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
+	// shutdown stops accepting requests first, so that no command can start
+	// while the running ones are being stopped.
+	shutdown := func() {
+		_ = srv.Close()
+		a.jobs.killAll()
+	}
+	// --listen is for tests: leave the developer's clipboard alone.
+	copyLines := func(lines [2]string) bool { return !exactPort && copyToClipboard(joinLines(lines)) }
 
 	awake := false
 	if !opts.allowSleep {
@@ -196,7 +210,7 @@ func run(args []string) int {
 	}
 	url := mcpURL(urlHost, cfg.Port, cfg.Token)
 	lines := connectionLines(name, url)
-	u.showLines(lines, copyToClipboard(joinLines(lines)))
+	u.showLines(lines, copyLines(lines))
 	interactive := isTerminal(os.Stdin)
 	u.tips(awake, interactive)
 	u.startActivityLog()
@@ -209,11 +223,11 @@ func run(args []string) int {
 	for {
 		select {
 		case <-ctx.Done():
-			a.jobs.killAll()
+			shutdown()
 			u.say("\n" + u.t("stopped"))
 			return 0
 		case err := <-serveErr:
-			a.jobs.killAll()
+			shutdown()
 			return u.fatal(ctx, u.t("listen.fail", err))
 		case line, ok := <-commands:
 			if !ok {
@@ -231,9 +245,9 @@ func run(args []string) int {
 				url = mcpURL(urlHost, cfg.Port, cfg.Token)
 				lines = connectionLines(name, url)
 				u.say("\n" + u.t("newkey.done"))
-				u.showLines(lines, copyToClipboard(joinLines(lines)))
+				u.showLines(lines, copyLines(lines))
 			case "quit":
-				a.jobs.killAll()
+				shutdown()
 				u.say(u.t("stopped"))
 				return 0
 			}
@@ -247,7 +261,8 @@ func run(args []string) int {
 func connectionLines(name, url string) [2]string {
 	return [2]string{
 		fmt.Sprintf("Remote Hands: please connect to my computer %s. It is an MCP server (streamable HTTP; the key is inside the URL, no other login): %s", name, url),
-		fmt.Sprintf("How: Claude Code -> claude mcp add -s user -t http %s <URL> ; Codex -> codex mcp add %s --url <URL> ; then tell me to restart you, and use the %s tools (start with system_info).", name, name, name),
+		fmt.Sprintf("How: Claude Code -> claude mcp add -s user -t http %s <URL> (if %s already exists, first: claude mcp remove -s user %s) ; Codex -> codex mcp add %s --url <URL> ; then tell me to restart you, and use the %s tools (start with system_info).",
+			name, name, name, name, name),
 	}
 }
 

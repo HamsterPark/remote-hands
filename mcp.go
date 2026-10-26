@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -68,12 +69,13 @@ func errorResult(format string, args ...any) toolResult {
 
 // app holds everything the HTTP handlers need.
 type app struct {
-	name  string // computer name shown to the AI
-	host  string // address in the connection URL
-	ui    *ui
-	jobs  *jobManager
-	peers *peerNames
-	tools []*toolDef
+	name        string // computer name shown to the AI
+	host        string // address in the connection URL
+	tailnetOnly bool   // refuse requests that do not come from a Tailscale address
+	ui          *ui
+	jobs        *jobManager
+	peers       *peerNames
+	tools       []*toolDef
 
 	mu         sync.RWMutex
 	token      string
@@ -110,10 +112,29 @@ func (a *app) routes() http.Handler {
 		a.serveMCP(w, r, r.PathValue("key"))
 	})
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		key, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		a.serveMCP(w, r, strings.TrimSpace(key))
+		key := ""
+		if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
+			key = strings.TrimSpace(auth[7:])
+		}
+		a.serveMCP(w, r, key)
 	})
 	return mux
+}
+
+// fromTailnet reports whether a request comes from a Tailscale address (or
+// this computer). Linux and macOS would also accept packets for the
+// Tailscale address that arrive through the local network.
+func fromTailnet(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	return ip.IsLoopback() || isTailscaleIP(ip)
 }
 
 func (a *app) serveMCP(w http.ResponseWriter, r *http.Request, key string) {
@@ -123,12 +144,16 @@ func (a *app) serveMCP(w http.ResponseWriter, r *http.Request, key string) {
 		http.Error(w, "remote-hands: requests from web pages are not allowed", http.StatusForbidden)
 		return
 	}
+	if a.tailnetOnly && !fromTailnet(r.RemoteAddr) {
+		http.Error(w, "remote-hands: only reachable through Tailscale", http.StatusForbidden)
+		return
+	}
 	who := a.caller(r)
 	if !a.checkKey(key) {
 		a.noteBadKey(who)
-		// 403 rather than 401: a 401 would make MCP clients start an OAuth
-		// login, which cannot work here.
-		http.Error(w, "remote-hands: wrong key. The connection lines were changed; copy the new 2 lines from the Remote Hands window on that computer.", http.StatusForbidden)
+		// 404, not 401 or 403: those make MCP clients start an OAuth login,
+		// which cannot work here.
+		http.Error(w, "remote-hands: wrong key. The connection lines were changed; copy the new 2 lines from the Remote Hands window on that computer.", http.StatusNotFound)
 		return
 	}
 	if r.Method != http.MethodPost {
