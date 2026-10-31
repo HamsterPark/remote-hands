@@ -18,9 +18,12 @@
   The window stays open at the end (press Enter to close) so you can read the
   connection line, the key location, or any error.
 
-  Undo: delete the line it added to the authorized_keys file it names (that
-  revokes this one key), or  Stop-Service sshd; Set-Service sshd -StartupType Manual
-  to turn SSH off entirely.
+  Undo: run this script with -Uninstall, or delete the line it added to the
+  authorized_keys file it names, or  Stop-Service sshd; Set-Service sshd
+  -StartupType Manual  to turn SSH off.
+
+  After a successful install it also saves %USERPROFILE%\.ssh\ai-remote.handoff.json
+  with the connection details, so you can read the connection line again later.
 
   ASCII only on purpose: Chinese Windows reads non-ASCII .ps1 files as GBK.
 
@@ -39,7 +42,8 @@ param(
     [string]$KeyName = 'ai-remote',
     [string]$PublicKey,   # authorize THIS public key (operator-generated) instead of making one
     [switch]$AllowLan,    # do NOT restrict SSH to Tailscale addresses
-    [switch]$IAgree       # skip the popup (for an unattended install); also skips the pause at the end
+    [switch]$IAgree,      # skip the popup (for an unattended install); also skips the pause at the end
+    [switch]$Uninstall    # revoke the key, stop sshd, remove handoff file (one-click undo)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,9 +53,107 @@ function Test-Admin {
     return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-AiRemoteAuthFile {
+    param([string]$UserName, [string]$SshDir)
+    $adminMember = $false
+    try {
+        $members = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.Name }
+        $adminMember = ($members -contains "$env:COMPUTERNAME\$UserName") -or ($members -contains "AzureAD\$UserName")
+    } catch { $adminMember = $false }
+    if ($adminMember) {
+        return (Join-Path $env:ProgramData 'ssh\administrators_authorized_keys')
+    }
+    return (Join-Path $SshDir 'authorized_keys')
+}
+
 try {
     if (-not (Test-Admin)) {
         throw 'Run this from an elevated PowerShell (right-click -> Run as administrator).'
+    }
+
+    $sshDir = Join-Path $env:USERPROFILE '.ssh'
+    $privPath = Join-Path $sshDir $KeyName
+    $handoffPath = Join-Path $sshDir 'ai-remote.handoff.json'
+
+    # --- Uninstall path (one-click undo) ------------------------------
+    if ($Uninstall) {
+        if (-not $IAgree) {
+            $msg = @"
+Remove AI remote access from THIS computer?
+
+This will:
+  - delete the '$KeyName' key line from the authorized_keys file;
+  - delete the private/public key files and the saved connection-details file;
+  - stop the OpenSSH server and set it to Manual start;
+  - remove the Tailscale-only SSH firewall rule this script may have set.
+
+Continue?
+"@
+            $agreed = $false
+            try {
+                Add-Type -AssemblyName System.Windows.Forms
+                $r = [System.Windows.Forms.MessageBox]::Show($msg, 'Remove AI remote access',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning)
+                $agreed = ($r -eq [System.Windows.Forms.DialogResult]::Yes)
+            } catch {
+                Write-Host $msg
+                $agreed = ((Read-Host 'Type  yes  to continue').Trim().ToLower() -eq 'yes')
+            }
+            if (-not $agreed) { Write-Host 'Cancelled. Nothing was changed.'; return }
+        }
+
+        $pubLine = $null
+        if (Test-Path -LiteralPath "$privPath.pub") {
+            try { $pubLine = (Get-Content -Raw -LiteralPath "$privPath.pub").Trim() } catch {}
+        }
+        if (-not $pubLine -and (Test-Path -LiteralPath $handoffPath)) {
+            try {
+                $hj = Get-Content -Raw -LiteralPath $handoffPath | ConvertFrom-Json
+                if ($hj.pub_line) { $pubLine = [string]$hj.pub_line }
+            } catch {}
+        }
+
+        $authFile = Get-AiRemoteAuthFile -UserName $User -SshDir $sshDir
+        if ($pubLine -and (Test-Path -LiteralPath $authFile)) {
+            $kept = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue |
+                Where-Object { $_.Trim() -ne $pubLine })
+            Set-Content -LiteralPath $authFile -Value $kept
+            if ($authFile -like '*administrators_authorized_keys') {
+                & icacls.exe $authFile /inheritance:r /grant 'SYSTEM:F' /grant 'BUILTIN\Administrators:F' | Out-Null
+            }
+            Write-Host "Removed the key line from $authFile."
+        } else {
+            Write-Host "No matching key line to remove (auth file: $authFile)."
+        }
+
+        foreach ($f in @($privPath, "$privPath.pub", $handoffPath)) {
+            if (Test-Path -LiteralPath $f) {
+                Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+                Write-Host "Deleted $f"
+            }
+        }
+
+        $ruleName = 'OpenSSH-Server-In-TCP'
+        if (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue) {
+            # Only remove the rule when we had narrowed it to Tailscale; a stock
+            # OpenSSH install may own the same name - leave a default-allow rule
+            # alone by resetting rather than deleting if AllowLan was used.
+            try { Remove-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue } catch {}
+            Write-Host "Removed firewall rule $ruleName (if present)."
+        }
+
+        try {
+            Stop-Service -Name sshd -ErrorAction SilentlyContinue
+            Set-Service -Name sshd -StartupType Manual -ErrorAction SilentlyContinue
+            Write-Host 'OpenSSH server stopped and set to Manual start.'
+        } catch {
+            Write-Host 'Could not stop sshd (it may not be installed).'
+        }
+
+        Write-Host ''
+        Write-Host 'AI remote access has been removed from this computer.' -ForegroundColor Cyan
+        return
     }
 
     # 1. Consent. A popup if a desktop is available, otherwise a console question.
@@ -94,9 +196,7 @@ script prints how). Continue?
     Write-Host 'OpenSSH server is installed and running (starts automatically from now on).'
 
     # 3. The key. Either authorize a public key you pass in, or make a new pair here.
-    $sshDir = Join-Path $env:USERPROFILE '.ssh'
     New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
-    $privPath = Join-Path $sshDir $KeyName
     $pubLine = $null
     $handoverNote = $null
     if ($PublicKey) {
@@ -113,30 +213,16 @@ script prints how). Continue?
         $handoverNote = "Carry this PRIVATE key file to the other computer: $privPath"
     }
 
-    # 4. Authorize the public key. Admins use a special, strictly-permissioned file.
-    #    Look the Administrators group up by SID (S-1-5-32-544): its NAME is
-    #    localised on non-English Windows (e.g. Chinese), so matching by name
-    #    would throw there and we would wrongly fall back to the per-user file,
-    #    which sshd ignores for administrators.
-    $adminMember = $false
-    try {
-        $members = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.Name }
-        $adminMember = ($members -contains "$env:COMPUTERNAME\$User") -or ($members -contains "AzureAD\$User")
-    } catch { $adminMember = $false }
-
-    if ($adminMember) {
-        $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-        if (-not (Test-Path -LiteralPath $authFile)) { New-Item -ItemType File -Force -Path $authFile | Out-Null }
-        $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
-        if ($existing -notcontains $pubLine) { Add-Content -LiteralPath $authFile -Value $pubLine }
+    # 4. Authorize the public key (admin users need administrators_authorized_keys).
+    $authFile = Get-AiRemoteAuthFile -UserName $User -SshDir $sshDir
+    if (-not (Test-Path -LiteralPath $authFile)) { New-Item -ItemType File -Force -Path $authFile | Out-Null }
+    $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
+    if ($existing -notcontains $pubLine) { Add-Content -LiteralPath $authFile -Value $pubLine }
+    if ($authFile -like '*administrators_authorized_keys') {
         # Required ACL: only SYSTEM and Administrators, nothing inherited.
         & icacls.exe $authFile /inheritance:r /grant 'SYSTEM:F' /grant 'BUILTIN\Administrators:F' | Out-Null
         Write-Host "Authorized the key in $authFile (admin user)."
     } else {
-        $authFile = Join-Path $sshDir 'authorized_keys'
-        if (-not (Test-Path -LiteralPath $authFile)) { New-Item -ItemType File -Force -Path $authFile | Out-Null }
-        $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
-        if ($existing -notcontains $pubLine) { Add-Content -LiteralPath $authFile -Value $pubLine }
         Write-Host "Authorized the key in $authFile (user $User)."
     }
 
@@ -163,17 +249,36 @@ script prints how). Continue?
     }
     $host4 = if ($tsip) { $tsip } else { '<this computer''s Tailscale IP>' }
 
-    # 7. Print what to take to the other computer.
+    # 7. Print what to take to the other computer, and save it for later.
+    $keyForLine = if ($PublicKey) { '<the private key file>' } else { $privPath }
+    $promptLine = ("Control my computer {0} over SSH:  ssh -i {1} -p {2} {3}@{4}" -f $env:COMPUTERNAME, $keyForLine, $Port, $User, $host4)
     Write-Host ''
     Write-Host '==================================================================' -ForegroundColor Cyan
     Write-Host ' Done. On your OTHER computer, give Claude Code / Codex this:' -ForegroundColor Cyan
     Write-Host '==================================================================' -ForegroundColor Cyan
-    Write-Host ("Control my computer {0} over SSH:  ssh -i {1} -p {2} {3}@{4}" -f $env:COMPUTERNAME, "<the private key file>", $Port, $User, $host4)
+    Write-Host $promptLine
     Write-Host $handoverNote
     if (-not $tsip) { Write-Host 'Tailscale address not found yet: install/log in to Tailscale, then run  tailscale ip -4  for the address.' }
     Write-Host ''
-    Write-Host 'To revoke later: delete that key line from the authorized_keys file above,'
+    Write-Host 'To revoke later: run this script with -Uninstall,'
+    Write-Host 'or delete that key line from the authorized_keys file above,'
     Write-Host 'or  Stop-Service sshd; Set-Service sshd -StartupType Manual  to turn SSH off.'
+
+    # Saved so closing this window does not lose the connection line.
+    $handoff = [ordered]@{
+        computer      = $env:COMPUTERNAME
+        user          = $User
+        port          = $Port
+        host          = $host4
+        key_path      = $(if ($PublicKey) { '' } else { $privPath })
+        auth_file     = $authFile
+        pub_line      = $pubLine
+        prompt_line   = $promptLine
+        handover_note = $handoverNote
+        updated_at    = (Get-Date).ToString('o')
+    }
+    ($handoff | ConvertTo-Json) | Set-Content -LiteralPath $handoffPath -Encoding UTF8
+    Write-Host "Connection details saved to: $handoffPath"
 }
 catch {
     Write-Host ''
