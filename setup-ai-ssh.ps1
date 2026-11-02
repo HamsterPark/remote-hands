@@ -185,9 +185,30 @@ script prints how). Continue?
     # 2. OpenSSH server: install the optional feature, then start it for good.
     $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' } | Select-Object -First 1
     if (-not $cap) { throw 'OpenSSH.Server capability not found on this Windows edition.' }
+    $restartNeeded = $false
     if ($cap.State -ne 'Installed') {
-        Write-Host 'Installing the OpenSSH server (one-time)...'
-        Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+        Write-Host 'Installing the OpenSSH server (one-time, downloads from Windows Update)...'
+        $addResult = Add-WindowsCapability -Online -Name $cap.Name
+        if ($addResult -and $addResult.RestartNeeded) { $restartNeeded = $true }
+    }
+
+    # The install registers the 'sshd' service; on some builds it is not there
+    # immediately, or the install needs a restart. Verify before using it, and
+    # say so clearly instead of letting Set-Service throw "sshd was not found".
+    if ($restartNeeded) {
+        throw 'OpenSSH server was staged but needs a RESTART to finish. Reboot this computer, then run this script again.'
+    }
+    $sshdSvc = $null
+    for ($i = 0; $i -lt 8 -and -not $sshdSvc; $i++) {
+        $sshdSvc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+        if (-not $sshdSvc) { Start-Sleep -Seconds 1 }
+    }
+    if (-not $sshdSvc) {
+        $capNow = (Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' } | Select-Object -First 1).State
+        if ($capNow -eq 'Installed') {
+            throw 'OpenSSH server is installed but its sshd service is missing. A RESTART usually registers it: reboot this computer, then run this script again.'
+        }
+        throw "OpenSSH server did not install (capability state: $capNow). Windows could not fetch it from Windows Update. Connect this computer to the internet and run again, or add it by hand in Settings > System > Optional features > Add a feature > OpenSSH Server, then run this script again."
     }
     Set-Service -Name sshd -StartupType Automatic
     Start-Service -Name sshd
